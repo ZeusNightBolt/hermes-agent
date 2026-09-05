@@ -209,25 +209,11 @@ _ONESHOT_RUN_CLAIM_TTL_HEADROOM = 3
 _DEFAULT_CRON_INACTIVITY_TIMEOUT = 600.0
 
 
-def _cron_inactivity_timeout_seconds() -> float:
-    """Resolve agent-cron inactivity from env, then profile config, then default."""
-    raw = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
-    if raw:
-        try:
-            return float(raw)
-        except (ValueError, TypeError):
-            return _DEFAULT_CRON_INACTIVITY_TIMEOUT
-    try:
-        from hermes_cli.config import load_config
-
-        config = load_config() or {}
-        cron_config = config.get("cron", {}) if isinstance(config, dict) else {}
-        configured = cron_config.get("agent_inactivity_timeout_seconds")
-        if configured is not None:
-            return float(configured)
-    except (ImportError, TypeError, ValueError):
-        pass
-    return _DEFAULT_CRON_INACTIVITY_TIMEOUT
+# Fork shim (2026-09-05): the implementation lives in the fork-only module
+# cron/fork_overrides.py so this hot upstream file carries a one-line alias
+# instead of a large merge-conflict-prone body. Ladder: env → profile config
+# → default (see fork_overrides docstring).
+from cron.fork_overrides import cron_inactivity_timeout_seconds as _cron_inactivity_timeout_seconds
 
 
 def _oneshot_run_claim_ttl_seconds() -> float:
