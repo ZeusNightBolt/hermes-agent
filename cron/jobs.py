@@ -160,6 +160,9 @@ _ONESHOT_RUN_CLAIM_TTL_HEADROOM = 3
 
 _DEFAULT_CRON_INACTIVITY_TIMEOUT = 600.0
 
+# Fork shim: cron timeout ladder (env -> profile config -> 600s) lives in cron/fork_overrides.py; see that module's docstring.
+from cron.fork_overrides import cron_inactivity_timeout_seconds as _cron_inactivity_timeout_seconds
+
 
 def _oneshot_run_claim_ttl_seconds() -> float:
     """One-shot running-claim TTL from ``HERMES_CRON_TIMEOUT``: unset/invalid → 600s → 1800s;
