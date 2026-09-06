@@ -63,6 +63,20 @@ Jobs are stored in `~/.hermes/cron/jobs.json` with atomic write semantics (write
 }
 ```
 
+### `last_status` literals
+
+`last_status` is a closed set written only by `cron.jobs.mark_job_run`. Every
+renderer (`hermes cron list`/`doctor`, the `cronjob` tool, the web dashboard
+badge, the Desktop routine inspector) maps each literal explicitly — a consumer
+must never test `== "ok"` for "the user got their result":
+
+| Literal | Meaning | Detail field |
+|---------|---------|--------------|
+| `ok` | Agent run succeeded and (if targeted) delivery was confirmed | — |
+| `error` | Agent run failed | `last_error` |
+| `delivery_failed` | Agent run succeeded, but the output never reached its target | `last_delivery_error` (`last_error` is `null`) |
+| `blocked_config` | Pre-dispatch validation refused to burn a run | `last_error` |
+
 ### Job Lifecycle States
 
 | State | Meaning |
@@ -215,9 +229,7 @@ The script timeout defaults to 3600 seconds (1 hour). `_get_script_timeout()` re
 3. **Config** — `cron.script_timeout_seconds` in `config.yaml` (read via `load_config()`)
 4. **Default** — 3600 seconds (1 hour)
 
-This timeout bounds the **pre-run script only**, not the agent. Script stdout and stderr are drained while it runs. When `cron.script_stall_timeout_seconds` is positive, a process that produces no output for that interval is terminated before the hard ceiling. An owner-only telemetry record at `cron/progress/<job-id>.json` exposes PID/start identity, heartbeat, output count, and terminal state for read-only polling; it never authorizes a retry or delivery.
-
-Skill-based / LLM-driven jobs run on a separate *inactivity*-based budget (`cron.agent_inactivity_timeout_seconds`, default 600s of idle time, `0` = unlimited; legacy `HERMES_CRON_TIMEOUT` overrides it) — they can run for hours as long as they keep calling tools or streaming tokens, and are only killed after the configured idle period with no activity. Scripts are dispatched to a persistent thread pool (not held under the tick lock), so a long-running script does not block other due jobs from firing.
+This timeout bounds the **pre-run script only**, not the agent. Skill-based / LLM-driven jobs run on a separate *inactivity*-based budget (`HERMES_CRON_TIMEOUT`, default 600s of idle time, `0` = unlimited) — they can run for hours as long as they keep calling tools or streaming tokens, and are only killed after the configured idle period with no activity. Scripts are dispatched to a persistent thread pool (not held under the tick lock), so a long-running script does not block other due jobs from firing.
 
 ### Provider Recovery
 

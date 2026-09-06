@@ -11,34 +11,13 @@ Tests cover:
 import concurrent.futures
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
 
 # Ensure project root is importable
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-
-
-def test_cron_inactivity_timeout_reads_profile_config(monkeypatch):
-    from cron.jobs import _cron_inactivity_timeout_seconds
-
-    monkeypatch.delenv("HERMES_CRON_TIMEOUT", raising=False)
-    (Path(os.environ["HERMES_HOME"]) / "config.yaml").write_text(
-        "cron:\n  agent_inactivity_timeout_seconds: 1800\n"
-    )
-
-    assert _cron_inactivity_timeout_seconds() == 1800.0
-
-
-def test_cron_inactivity_env_override_remains_backward_compatible(monkeypatch):
-    from cron.jobs import _cron_inactivity_timeout_seconds
-
-    (Path(os.environ["HERMES_HOME"]) / "config.yaml").write_text(
-        "cron:\n  agent_inactivity_timeout_seconds: 1800\n"
-    )
-    monkeypatch.setenv("HERMES_CRON_TIMEOUT", "1200")
-
-    assert _cron_inactivity_timeout_seconds() == 1200.0
 
 
 class FakeAgent:
@@ -256,4 +235,74 @@ class TestSysPathOrdering:
         # This import would fail if sys.path.insert comes after the import
         from cron.scheduler import _hermes_now
         assert callable(_hermes_now)
+
+
+class TestInactivityWatchdogLoop:
+    """The daemon-thread inactivity helper must not depend on the caller thread."""
+
+    def test_fires_when_idle_crosses_limit(self):
+        from cron.scheduler import _inactivity_watchdog_loop
+
+        stop = threading.Event()
+        idle = {"s": 0.0}
+        results: list = []
+
+        def _watch():
+            results.append(
+                _inactivity_watchdog_loop(
+                    get_idle_seconds=lambda: idle["s"],
+                    limit_s=0.2,
+                    poll_s=0.05,
+                    stop=stop,
+                    future_done=lambda: False,
+                )
+            )
+
+        watcher = threading.Thread(target=_watch, daemon=True)
+        watcher.start()
+        time.sleep(0.12)
+        idle["s"] = 1.0
+        watcher.join(timeout=2.0)
+        stop.set()
+        assert results == [True]
+        assert not watcher.is_alive()
+
+    def test_stops_when_future_completes_before_idle_limit(self):
+        from cron.scheduler import _inactivity_watchdog_loop
+
+        stop = threading.Event()
+        fired = _inactivity_watchdog_loop(
+            get_idle_seconds=lambda: 0.0,
+            limit_s=10.0,
+            poll_s=0.05,
+            stop=stop,
+            future_done=lambda: True,
+        )
+        assert fired is False
+
+    def test_fires_while_caller_thread_is_blocked(self):
+        """#94285: a blocked run_job thread must not disable the watchdog."""
+        from cron.scheduler import _inactivity_watchdog_loop
+
+        stop = threading.Event()
+        idle = {"s": 1.0}
+        result = {"fired": None}
+
+        def _watch():
+            result["fired"] = _inactivity_watchdog_loop(
+                get_idle_seconds=lambda: idle["s"],
+                limit_s=0.15,
+                poll_s=0.05,
+                stop=stop,
+                future_done=lambda: False,
+            )
+
+        watcher = threading.Thread(target=_watch, daemon=True)
+        watcher.start()
+        # Simulate the family-A stall: this thread cannot poll.
+        time.sleep(0.4)
+        watcher.join(timeout=2.0)
+        stop.set()
+        assert result["fired"] is True
+        assert not watcher.is_alive()
 

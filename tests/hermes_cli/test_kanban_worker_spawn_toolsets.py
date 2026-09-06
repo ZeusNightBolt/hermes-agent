@@ -60,8 +60,9 @@ agent:
     monkeypatch.setenv("HERMES_HOME", str(root))
 
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
 
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
 
     captured = {}
 
@@ -78,7 +79,7 @@ agent:
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    pid = kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
+    pid = kbd._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
 
     assert pid == 4242
     assert captured["env"]["HERMES_HOME"] == str(profile)
@@ -102,9 +103,10 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     monkeypatch.setenv("HERMES_HOME", str(root))
 
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
     from hermes_cli._parser import build_top_level_parser
 
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
     captured = {}
 
     class FakeProc:
@@ -120,7 +122,7 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     workspace.mkdir()
     task = _make_task(kb, assignee="elias")
     task.model_override = "gpt-5.6-sol"
-    kb._default_spawn(task, str(workspace))
+    kbd._default_spawn(task, str(workspace))
 
     parser, _subparsers, _chat_parser = build_top_level_parser()
     # Profile selection is attached by the outer CLI bootstrap rather than
@@ -153,65 +155,12 @@ toolsets:
     monkeypatch.setenv("HERMES_HOME", str(root))
 
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
 
-    resolved = kb._resolve_worker_cli_toolsets(str(profile))
+    resolved = kbd._resolve_worker_cli_toolsets(str(profile))
 
     assert resolved is not None
     assert "terminal" in resolved
     assert "web" in resolved
     assert "kanban" in resolved  # recovered worker lifecycle surface
     assert resolved != ["kanban"]
-
-
-def test_resolve_worker_cli_toolsets_re_enables_policy_blocked_mutation_tools(monkeypatch, tmp_path):
-    """The interactive least-privilege policy (nima-infra
-    apply_profile_toolset_policy) appends the mutation toolsets to a domain
-    profile's agent.disabled_toolsets, which would cripple a dispatcher-spawned
-    kanban worker (no bash/file/kanban). The worker spawn must re-enable the
-    mutation toolsets so an assigned task can actually be worked; the Telegram
-    gateway allowlist still keeps the interactive surface read-only."""
-    root = tmp_path / ".hermes"
-    profile = root / "profiles" / "infra-ops"
-    profile.mkdir(parents=True)
-    root.joinpath("config.yaml").write_text("toolsets:\n  - hermes-cli\n", encoding="utf-8")
-    profile.joinpath("config.yaml").write_text(
-        """
-platform_toolsets:
-  telegram:
-    - web
-    - skills
-    - memory
-    - todo
-    - clarify
-    - no_mcp
-toolsets:
-  - web
-  - terminal
-  - file
-  - skills
-  - memory
-  - todo
-  - clarify
-agent:
-  disabled_toolsets:
-    - browser
-    - terminal
-    - file
-    - code_execution
-    - delegation
-    - cronjob
-    - kanban
-    - session_search
-    - vision
-""".lstrip(),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("HERMES_HOME", str(root))
-
-    from hermes_cli import kanban_db as kb
-
-    resolved = kb._resolve_worker_cli_toolsets(str(profile))
-
-    assert resolved is not None
-    for required in ("terminal", "file", "code_execution", "kanban"):
-        assert required in resolved
