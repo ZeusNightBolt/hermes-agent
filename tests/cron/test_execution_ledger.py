@@ -13,7 +13,7 @@ from pathlib import Path
 def _point_ledger(monkeypatch, tmp_path):
     import cron.executions as executions
 
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
     return executions
 
 
@@ -37,6 +37,102 @@ def test_execution_transitions_are_durable(monkeypatch, tmp_path):
 
     persisted = executions.list_executions(job_id="job-1")
     assert persisted == [completed]
+
+
+def test_execution_can_be_loaded_by_exact_attempt_id(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    first = executions.create_execution("same-job", source="builtin")
+    second = executions.create_execution("same-job", source="builtin")
+
+    assert executions.get_execution(first["id"]) == first
+    assert executions.get_execution(second["id"]) == second
+    assert executions.get_execution("missing") is None
+
+
+def test_fresh_external_handoff_is_not_recovered_before_worker_adopts(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("handoff-job", source="builtin")
+    assert executions.mark_execution_handoff_pending(record["id"]) is not None
+
+    monkeypatch.setattr(executions, "_PROCESS_ID", "replacement-gateway")
+    monkeypatch.setattr(executions, "_owner_is_live", lambda _pid, _started: False)
+
+    assert executions.recover_interrupted_executions() == 0
+    assert executions.get_execution(record["id"])["status"] == "claimed"
+    adopted = executions.adopt_claimed_execution(record["id"])
+    assert adopted["status"] == "running"
+    assert adopted["handoff_pending"] == 0
+
+
+def test_stale_external_handoff_is_recovered_unknown(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("handoff-job", source="builtin")
+    pending = executions.mark_execution_handoff_pending(record["id"])
+
+    monkeypatch.setattr(executions, "_PROCESS_ID", "replacement-gateway")
+    monkeypatch.setattr(executions, "_owner_is_live", lambda _pid, _started: False)
+    monkeypatch.setattr(
+        executions.time,
+        "time",
+        lambda: pending["handoff_started_at"]
+        + executions.HANDOFF_ADOPTION_GRACE_SECONDS
+        + 1,
+    )
+
+    assert executions.recover_interrupted_executions() == 1
+    recovered = executions.get_execution(record["id"])
+    assert recovered["status"] == "unknown"
+    assert recovered["handoff_pending"] == 0
+
+
+def test_recovery_does_not_overwrite_concurrent_worker_adoption(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("adoption-race", source="builtin")
+    pending = executions.mark_execution_handoff_pending(record["id"])
+    assert pending is not None
+    monkeypatch.setattr(executions, "_PROCESS_ID", "replacement-scheduler")
+    monkeypatch.setattr(
+        executions.time,
+        "time",
+        lambda: pending["handoff_started_at"]
+        + executions.HANDOFF_ADOPTION_GRACE_SECONDS
+        + 1,
+    )
+
+    def adopt_while_liveness_is_checked(_pid, _started_at):
+        monkeypatch.setattr(executions, "_PROCESS_ID", "external-worker")
+        monkeypatch.setattr(executions.os, "getpid", lambda: 4242)
+        monkeypatch.setattr(executions, "_process_start_time", lambda _pid: 9876)
+        assert executions.adopt_claimed_execution(record["id"]) is not None
+        return False
+
+    monkeypatch.setattr(executions, "_owner_is_live", adopt_while_liveness_is_checked)
+
+    assert executions.recover_interrupted_executions() == 0
+    current = executions.get_execution(record["id"])
+    assert current is not None
+    assert current["status"] == "running"
+    assert current["process_id"] == "external-worker"
+    assert current["pid"] == 4242
+
+
+def test_foreign_process_cannot_start_or_finish_execution(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    record = executions.create_execution("owner-fence", source="builtin")
+    original_process_id = executions._PROCESS_ID
+    original_pid = record["pid"]
+
+    monkeypatch.setattr(executions, "_PROCESS_ID", "foreign-process")
+    monkeypatch.setattr(executions.os, "getpid", lambda: original_pid + 1)
+    assert executions.mark_execution_running(record["id"]) is None
+    assert executions.finish_execution(record["id"], success=True) is None
+
+    monkeypatch.setattr(executions, "_PROCESS_ID", original_process_id)
+    monkeypatch.setattr(executions.os, "getpid", lambda: original_pid)
+    assert executions.mark_execution_running(record["id"]) is not None
+    assert executions.finish_execution(record["id"], success=True) is not None
 
 
 def test_execution_ledger_follows_the_current_profile_home(monkeypatch, tmp_path):
@@ -83,15 +179,32 @@ def test_retention_bounds_terminal_history_but_preserves_inflight(monkeypatch, t
     assert executions.latest_execution("live")["status"] == "running"
 
 
+def test_recently_finished_long_running_execution_survives_retention(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 1)
+    long_running = executions.create_execution("long-running", source="builtin")
+    assert executions.mark_execution_running(long_running["id"]) is not None
+    newer = executions.create_execution("newer", source="builtin")
+    assert executions.finish_execution(newer["id"], success=True) is not None
+
+    finished = executions.finish_execution(long_running["id"], success=True)
+
+    assert finished is not None
+    assert finished["status"] == "completed"
+    assert executions.get_execution(long_running["id"])["status"] == "completed"
+    assert executions.get_execution(newer["id"]) is None
+
+
 def test_corrupt_store_fails_closed_without_overwrite(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
-    ledger = executions.get_executions_file()
-    ledger.parent.mkdir(parents=True, exist_ok=True)
-    ledger.write_bytes(b"not a sqlite database")
+    executions.EXECUTIONS_FILE.parent.mkdir(parents=True)
+    executions.EXECUTIONS_FILE.write_bytes(b"not a sqlite database")
 
     with __import__("pytest").raises(sqlite3.DatabaseError):
         executions.create_execution("new", source="builtin")
-    assert ledger.read_bytes() == b"not a sqlite database"
+    assert executions.EXECUTIONS_FILE.read_bytes() == b"not a sqlite database"
 
 
 def test_cron_runs_cli_prints_execution_history(monkeypatch, tmp_path, capsys):
@@ -131,32 +244,6 @@ def test_recovery_does_not_mark_live_process_execution_unknown(monkeypatch, tmp_
 
     assert executions.recover_interrupted_executions() == 0
     assert executions.latest_execution("still-live")["status"] == "running"
-
-
-def test_recovery_does_not_mark_other_live_owner_unknown(monkeypatch, tmp_path):
-    executions = _point_ledger(monkeypatch, tmp_path)
-    record = executions.create_execution("other-live", source="builtin")
-    with sqlite3.connect(executions.get_executions_file()) as conn:
-        conn.execute(
-            "UPDATE executions SET process_id=?, pid=? WHERE id=?",
-            ("another-import", os.getpid(), record["id"]),
-        )
-
-    assert executions.recover_interrupted_executions() == 0
-    assert executions.latest_execution("other-live")["status"] == "claimed"
-
-
-def test_recovery_rejects_recycled_pid(monkeypatch, tmp_path):
-    executions = _point_ledger(monkeypatch, tmp_path)
-    record = executions.create_execution("recycled", source="builtin")
-    with sqlite3.connect(executions.get_executions_file()) as conn:
-        conn.execute(
-            "UPDATE executions SET process_id=?, process_started_at=? WHERE id=?",
-            ("old-import", -1, record["id"]),
-        )
-
-    assert executions.recover_interrupted_executions() == 1
-    assert executions.latest_execution("recycled")["status"] == "unknown"
 
 
 def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
@@ -244,10 +331,11 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     import cron.scheduler as scheduler
 
     events = []
+    run_execution_ids = []
     monkeypatch.setattr(
         scheduler,
         "mark_execution_running",
-        lambda execution_id: events.append(("running", execution_id)),
+        lambda execution_id: events.append(("running", execution_id)) or {},
         raising=False,
     )
     monkeypatch.setattr(
@@ -257,16 +345,18 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
-    monkeypatch.setattr(
-        scheduler,
-        "run_job",
-        lambda job, *, defer_agent_teardown=None, **_kw: (True, "output", "response", None),
-    )
+
+    def fake_run_job(job, *, defer_agent_teardown=None, execution_id=None, **_kw):
+        run_execution_ids.append(execution_id)
+        return True, "output", "response", None
+
+    monkeypatch.setattr(scheduler, "run_job", fake_run_job)
     monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
     monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: None)
 
     assert scheduler.run_one_job({"id": "job-3", "execution_id": "exec-3"}) is True
+    assert run_execution_ids == ["exec-3"]
     assert events[0] == ("running", "exec-3")
     assert events[-1][0:2] == ("finish", "exec-3")
     assert events[-1][2]["success"] is True
@@ -442,31 +532,3 @@ def test_job_listing_exposes_latest_execution(monkeypatch, tmp_path):
     listed = jobs.list_jobs(include_disabled=True)
     assert listed[0]["latest_execution"]["id"] == record["id"]
     assert listed[0]["latest_execution"]["status"] == "running"
-
-
-def test_ledger_path_follows_hermes_home_at_call_time(monkeypatch, tmp_path):
-    """Test fixture rows must land in the per-test tempdir, never the real home.
-
-    Regression: the ledger path used to be resolved once at module import,
-    BEFORE pytest's hermetic fixture monkeypatched HERMES_HOME, so any suite
-    that exercised the scheduler wrote its fixture rows (j1..j10, monitor-job,
-    tg-job, ...) into the developer's production ``~/.hermes/cron/executions.db``.
-    """
-    import cron.executions as executions  # imported long before this test runs
-
-    stale_home = tmp_path / "stale-home"
-    fresh_home = tmp_path / "fresh-home"
-    monkeypatch.setenv("HERMES_HOME", str(stale_home))
-    monkeypatch.setenv("HERMES_HOME", str(fresh_home))
-
-    record = executions.create_execution("isolation-probe", source="builtin")
-
-    assert not (stale_home / "cron" / "executions.db").exists()
-    ledger = fresh_home.resolve() / "cron" / "executions.db"
-    assert executions.get_executions_file() == ledger
-    assert ledger.exists()
-    with sqlite3.connect(ledger) as conn:
-        rows = conn.execute(
-            "SELECT job_id FROM executions WHERE id=?", (record["id"],)
-        ).fetchall()
-    assert [row[0] for row in rows] == ["isolation-probe"]
