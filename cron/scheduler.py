@@ -952,17 +952,17 @@ def _inactivity_watchdog_loop(
 
 
 def _cron_inactivity_seconds() -> float:
-    """Parse HERMES_CRON_TIMEOUT (seconds). 0 = unlimited; bad input = 600. Shared by the
-    inactivity monitor and the cwd-lock bound so they can't drift: the lock bound must stay >= the
-    inactivity limit or waiters fail while a healthy holder runs."""
-    raw = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
-    if not raw:
-        return 600.0
-    try:
-        return float(raw)
-    except (ValueError, TypeError):
-        logger.warning("Invalid HERMES_CRON_TIMEOUT=%r; using default 600s", raw)
-        return 600.0
+    """
+    Inactivity limit (seconds) via the fork ladder.
+
+    Delegates to cron.fork_overrides.cron_inactivity_timeout_seconds(),
+    preserving upstream semantics: env HERMES_CRON_TIMEOUT wins
+    (0 = unlimited, invalid input falls back to 600.0), then profile
+    config cron.agent_inactivity_timeout_seconds, then 600.0 default.
+    """
+    # FORK-ATTACH(fork_overrides) delegating resolver (upstream env-only body replaced).
+    from cron.fork_overrides import cron_inactivity_timeout_seconds
+    return cron_inactivity_timeout_seconds()
 
 
 def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadPoolExecutor:
